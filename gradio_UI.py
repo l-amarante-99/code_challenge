@@ -1,0 +1,146 @@
+import gradio as gr
+import os
+from pdf_loader import load_pdf
+from text_splitter import split_documents
+from vector_store import build_vector_store
+from chatbot import retrieve_answers
+from langchain_ollama import OllamaLLM
+
+# Keep a global vectorstore for the current session
+vectorstore = None
+
+# Instantiate TinyLlama
+llm = OllamaLLM(model="tinyllama")
+
+def handle_upload(files):
+    global vectorstore
+
+    all_documents = []
+    for file_path in files:
+        documents = load_pdf(file_path)
+        all_documents.extend(documents)
+
+    split_docs = split_documents(all_documents, chunk_size=1000, chunk_overlap=100)
+
+    if vectorstore is None:
+        vectorstore = build_vector_store(split_docs)
+    else:
+        vectorstore.add_documents(split_docs)
+
+    return f"✅ Loaded {len(files)} PDFs. Vector store now contains {len(split_docs)} new chunks."
+
+def answer_question(question, progress=gr.Progress()):
+    global vectorstore
+
+    if vectorstore is None:
+        return "<div class='output-box'>⚠️ Please upload PDFs first.</div>"
+
+    # Simulate progress bar (optional)
+    for i in range(10):
+        progress(i / 10)
+
+    results = retrieve_answers(vectorstore, question, k=10)
+
+    if not results:
+        return "<div class='output-box'>No matching content found.</div>"
+
+    file_pages = {}
+
+    context = ""
+    for res in results:
+        page = res.metadata.get("page_number", "?")
+        if isinstance(page, (list, tuple)):
+            page = page[0]
+        source = res.metadata.get("source", "unknown.pdf")
+        chunk_text = res.page_content.strip().replace("\n", " ")
+
+        context += f"\n[Page {page} — {source}]\n{chunk_text}\n"
+
+        if source not in file_pages:
+            file_pages[source] = set()
+        if page != "?":
+            file_pages[source].add(page)
+
+    prompt = f"""You are an assistant helping to answer questions about uploaded PDF documents.
+
+When asked "What is the text about?", produce a summary of the overall topics and contributions of the documents, in plain language. 
+Do not simply list references or citations unless specifically asked.
+When asked "What are the conclusions of the paper?", provide a concise summary of the main conclusions drawn in the documents.
+When asked "What are the key findings?", summarize the most important findings or results presented in the documents.
+
+Use the following context to answer the question below. 
+If the answer isn't contained in the context, say "I couldn't find that information."
+
+Context:
+{context}
+
+Question:
+{question}
+"""
+
+    answer = llm.invoke(prompt)
+
+    # Format grouped citations
+    if file_pages:
+        citation_text = "\n\nSources used:\n"
+        for i, (file, pages) in enumerate(sorted(file_pages.items()), start=1):
+            if pages:
+                sorted_pages = sorted(pages, key=lambda x: int(x) if str(x).isdigit() else x)
+                pages_str = ", ".join(str(p) for p in sorted_pages)
+                citation_text += f"{i}. {file}, pages: {pages_str}\n"
+            else:
+                citation_text += f"{i}. {file}\n"
+    else:
+        citation_text = "\n\nNo sources found."
+
+    html_output = f"<div class='output-box'>{answer}{citation_text}</div>"
+
+    return html_output
+
+upload_ui = gr.File(
+    file_count="multiple",
+    type="filepath",
+    label="Upload your PDFs"
+)
+
+question_ui = gr.Textbox(
+    label="Ask a question about your PDFs",
+    placeholder="e.g. What are the conclusions of the paper?",
+    lines=2
+)
+
+output_ui = gr.HTML()
+
+demo = gr.Interface(
+    fn=lambda files, q: (handle_upload(files), answer_question(q))[1],
+    inputs=[upload_ui, question_ui],
+    outputs=output_ui,
+    title="PDF Chatbot",
+    description="Upload PDFs and ask questions. The chatbot will search your documents and generate answers using TinyLlama.",
+    css="""
+    body {
+      background-color: #f5f7fa;
+    }
+    .gradio-container {
+      background-color: #f5f7fa;
+    }
+    .gr-button-primary {
+      background-color: #70A1D7 !important;
+      border-color: #70A1D7 !important;
+      color: #ffffff !important;
+    }
+    .output-box {
+      background-color: #ffffff;
+      border: 2px solid #70A1D7;
+      border-radius: 8px;
+      padding: 16px;
+      margin-top: 16px;
+      color: #333333;
+      font-size: 16px;
+      white-space: pre-wrap;
+    }
+    """,
+    allow_flagging="never"
+)
+
+demo.launch()

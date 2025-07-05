@@ -1,5 +1,6 @@
 import gradio as gr
 import os
+import time
 from pdf_loader import load_pdf
 from text_splitter import split_documents
 from vector_store import build_vector_store
@@ -29,20 +30,22 @@ def handle_upload(files):
 
     return f"✅ Loaded {len(files)} PDFs. Vector store now contains {len(split_docs)} new chunks."
 
-def answer_question(question, progress=gr.Progress()):
+def answer_question(question, progress=gr.Progress(track_tqdm=True)):
     global vectorstore
 
     if vectorstore is None:
-        return "<div class='output-box'>⚠️ Please upload PDFs first.</div>"
+        yield "<div class='output-box'>⚠️ Please upload PDFs first.</div>"
+        return
 
-    # Simulate progress bar (optional)
-    for i in range(10):
-        progress(i / 10)
+    for i in range(50):
+        time.sleep(0.02)
+        progress((i + 1) / 50)
 
     results = retrieve_answers(vectorstore, question, k=10)
 
     if not results:
-        return "<div class='output-box'>No matching content found.</div>"
+        yield "<div class='output-box'>No matching content found.</div>"
+        return
 
     file_pages = {}
 
@@ -95,52 +98,75 @@ Question:
 
     html_output = f"<div class='output-box'>{answer}{citation_text}</div>"
 
-    return html_output
+    yield html_output
 
-upload_ui = gr.File(
-    file_count="multiple",
-    type="filepath",
-    label="Upload your PDFs"
-)
+# Define your custom CSS
+css = """
+body, .gradio-container {
+    background-color: #e6f0fa;
+}
 
-question_ui = gr.Textbox(
-    label="Ask a question about your PDFs",
-    placeholder="e.g. What are the conclusions of the paper?",
-    lines=2
-)
+.gr-button-primary {
+    background: linear-gradient(90deg, #70A1D7, #8A89C0);
+    color: white;
+    border: none;
+}
 
-output_ui = gr.HTML()
+.output-box {
+    background-color: white;
+    border: 2px solid #70A1D7;
+    border-radius: 8px;
+    padding: 16px;
+    margin-top: 16px;
+    color: #333333;
+    font-size: 16px;
+    white-space: pre-wrap;
+}
+"""
 
-demo = gr.Interface(
-    fn=lambda files, q: (handle_upload(files), answer_question(q))[1],
-    inputs=[upload_ui, question_ui],
-    outputs=output_ui,
-    title="PDF Chatbot",
-    description="Upload PDFs and ask questions. The chatbot will search your documents and generate answers using TinyLlama.",
-    css="""
-    body {
-      background-color: #f5f7fa;
-    }
-    .gradio-container {
-      background-color: #f5f7fa;
-    }
-    .gr-button-primary {
-      background-color: #70A1D7 !important;
-      border-color: #70A1D7 !important;
-      color: #ffffff !important;
-    }
-    .output-box {
-      background-color: #ffffff;
-      border: 2px solid #70A1D7;
-      border-radius: 8px;
-      padding: 16px;
-      margin-top: 16px;
-      color: #333333;
-      font-size: 16px;
-      white-space: pre-wrap;
-    }
-    """,
-    allow_flagging="never"
-)
+theme = gr.themes.Soft(primary_hue="blue", neutral_hue="slate")
+
+with gr.Blocks(theme=theme, css=css) as demo:
+    gr.Markdown("## PDF Chatbot")
+    gr.Markdown(
+        "Upload PDFs and ask questions. "
+        "The chatbot will search your documents and generate answers using TinyLlama."
+    )
+
+    upload_ui = gr.File(
+        file_count="multiple",
+        type="filepath",
+        label="Upload your PDFs"
+    )
+
+    question_ui = gr.Textbox(
+        label="Ask a question about your PDFs",
+        placeholder="e.g. What are the conclusions of the paper?",
+        lines=2
+    )
+
+    output_ui = gr.HTML()
+
+    with gr.Row():
+        clear_btn = gr.Button("Clear")
+        submit_btn = gr.Button("Submit", variant="primary")
+
+    def full_pipeline(files, question):
+        upload_msg = handle_upload(files)
+        for result in answer_question(question):
+            pass
+        return result
+
+    submit_btn.click(
+        fn=full_pipeline,
+        inputs=[upload_ui, question_ui],
+        outputs=output_ui
+    )
+
+    clear_btn.click(
+        lambda: "",
+        None,
+        output_ui
+    )
 
 demo.launch()

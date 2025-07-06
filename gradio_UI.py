@@ -6,6 +6,8 @@ from text_splitter import split_documents
 from vector_store import build_vector_store
 from chatbot import retrieve_answers
 from langchain_ollama import OllamaLLM
+from ollama_stream import stream_ollama
+
 
 # Keep a global vectorstore for the current session
 vectorstore = None
@@ -30,19 +32,16 @@ def handle_upload(files):
 
     return f"✅ Loaded {len(files)} PDFs. Vector store now contains {len(split_docs)} new chunks."
 
-def answer_question(question, progress=gr.Progress(track_tqdm=True)):
+from ollama_stream import stream_ollama
+
+def answer_question(files, question):
     global vectorstore
 
     if vectorstore is None:
         yield "<div class='output-box'>⚠️ Please upload PDFs first.</div>"
         return
 
-    # Simulate quick progress animation
-    for i in range(5):
-        time.sleep(0.05)
-        progress((i + 1) / 5)
-
-    results = retrieve_answers(vectorstore, question, k=10)
+    results = retrieve_answers(vectorstore, question, k=3)
 
     if not results:
         yield "<div class='output-box'>No matching content found.</div>"
@@ -65,14 +64,14 @@ def answer_question(question, progress=gr.Progress(track_tqdm=True)):
         if page != "?":
             file_pages[source].add(page)
 
-    prompt = f"""You are an assistant helping to answer questions about uploaded PDF documents.
+    system_prompt = """You are an assistant helping to answer questions about uploaded PDF documents.
 
 When asked "What is the text about?", produce a summary of the overall topics and contributions of the documents, in plain language. 
 Do not simply list references or citations unless specifically asked.
 When asked "What are the conclusions of the paper?", provide a concise summary of the main conclusions drawn in the documents.
-When asked "What are the key findings?", summarize the most important findings or results presented in the documents.
+When asked "What are the key findings?", summarize the most important findings or results presented in the documents."""
 
-Use the following context to answer the question below. 
+    prompt = f"""Use the following context to answer the question below. 
 If the answer isn't contained in the context, say "I couldn't find that information."
 
 Context:
@@ -82,9 +81,6 @@ Question:
 {question}
 """
 
-    answer = llm.invoke(prompt)
-
-    # Format grouped citations
     if file_pages:
         citation_text = "\n\nSources used:\n"
         for i, (file, pages) in enumerate(sorted(file_pages.items()), start=1):
@@ -97,9 +93,14 @@ Question:
     else:
         citation_text = "\n\nNo sources found."
 
-    html_output = f"<div class='output-box'>{answer}{citation_text}</div>"
-
-    yield html_output
+    for partial_text in stream_ollama("tinyllama", system_prompt, prompt):
+        combined_text = f"{partial_text}{citation_text}"
+        html_output = f"""
+        <div class="gr-box" style="display: block; padding: 16px; margin-top: 16px;">
+            <div id="output">{combined_text}</div>
+        </div>
+        """
+        yield html_output
 
 # Define custom CSS
 css = """
@@ -113,12 +114,15 @@ button {
     border: none !important;
 }
 
-.output-box {
-    background-color: white;
-    border: 2px solid #70A1D7;
+.gr-box {
+    border: 2px solid #70A1D7 !important;
     border-radius: 8px;
-    padding: 16px;
-    margin-top: 16px;
+    background-color: white;
+}
+
+#output {
+    min-height: 20px;
+    overflow-y: auto;
     color: #333333;
     font-size: 16px;
     white-space: pre-wrap;
@@ -146,7 +150,8 @@ with gr.Blocks(theme=theme, css=css) as demo:
         lines=2
     )
 
-    output_ui = gr.HTML()
+    with gr.Group():
+        output_ui = gr.HTML(elem_id="output")
 
     upload_ui.change(
         fn=handle_upload,
@@ -158,16 +163,15 @@ with gr.Blocks(theme=theme, css=css) as demo:
         clear_btn = gr.Button("Clear")
         submit_btn = gr.Button("Submit", variant="primary")
 
-    # Connect Submit button
     submit_btn.click(
         fn=answer_question,
-        inputs=[question_ui],
+        inputs=[upload_ui, question_ui],
         outputs=output_ui
     )
 
     question_ui.submit(
         fn=answer_question,
-        inputs=[question_ui],
+        inputs=[upload_ui, question_ui],
         outputs=output_ui
     )
 

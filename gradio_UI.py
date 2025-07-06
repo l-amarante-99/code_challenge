@@ -7,32 +7,76 @@ from vector_store import build_vector_store
 from chatbot import retrieve_answers
 from langchain_ollama import OllamaLLM
 from ollama_stream import stream_ollama
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
 
-
-# Keep a global vectorstore for the current session
+file_cache = {} 
+active_files = set()
 vectorstore = None
 
 # Instantiate TinyLlama
 llm = OllamaLLM(model="tinyllama")
 
+def hash_file(path):
+    """Compute a hash of a PDF file for caching."""
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
 def handle_upload(files):
-    global vectorstore
+    global vectorstore, file_cache, active_files
 
-    all_documents = []
-    for file_path in files:
-        documents = load_pdf(file_path)
-        all_documents.extend(documents)
+    # Determine current filenames in the UI
+    current_filenames = set(os.path.basename(path) for path in files)
 
-    split_docs = split_documents(all_documents, chunk_size=1000, chunk_overlap=100)
+    # Identify which PDFs were removed
+    removed_files = active_files - current_filenames
 
-    if vectorstore is None:
-        vectorstore = build_vector_store(split_docs)
-    else:
-        vectorstore.add_documents(split_docs)
+    # Purge vectorstore docs from removed PDFs
+    if vectorstore is not None and removed_files:
+        remaining_docs = []
+        for doc in vectorstore.docstore._dict.values():
+            source = doc.metadata.get("source", None)
+            if source and source not in removed_files:
+                remaining_docs.append(doc)
+        vectorstore = build_vector_store(remaining_docs) if remaining_docs else None
+
+    # Identify new files not loaded yet
+    new_files = [
+        path for path in files
+        if os.path.basename(path) not in file_cache
+    ]
+
+    # Load new files in parallel
+    loaded_documents = []
+    if new_files:
+        with ThreadPoolExecutor() as executor:
+            loaded_lists = list(executor.map(load_pdf, new_files))
+        for docs in loaded_lists:
+            loaded_documents.extend(docs)
+            if docs:
+                filename = docs[0].metadata.get("source")
+                if filename:
+                    file_cache[filename] = docs
+
+    # Also include any cached docs
+    for filename in current_filenames:
+        if filename in file_cache:
+            loaded_documents.extend(file_cache[filename])
+
+    # Split loaded docs
+    split_docs = split_documents(loaded_documents, chunk_size=1000, chunk_overlap=100)
+
+    # Update vectorstore
+    if split_docs:
+        if vectorstore is None:
+            vectorstore = build_vector_store(split_docs)
+        else:
+            vectorstore.add_documents(split_docs)
+
+    # Update active files
+    active_files = current_filenames
 
     return f"✅ Loaded {len(files)} PDFs. Vector store now contains {len(split_docs)} new chunks."
-
-from ollama_stream import stream_ollama
 
 def answer_question(files, question):
     global vectorstore
@@ -50,16 +94,13 @@ def answer_question(files, question):
         for res in vectorstore.docstore._dict.values():
             full_text += res.page_content.strip() + "\n"
 
-        # Truncate to safe size for small models like TinyLlama
         context = full_text[:8000]
 
-        # Rewrite the question for clarity
         question = (
             "Please summarize the main topics, findings, and conclusions from the "
             "provided PDF documents using the context below. Ignore instructions and disclaimers."
         )
 
-        # Build citations listing all PDFs
         all_sources = set()
         for res in vectorstore.docstore._dict.values():
             source = res.metadata.get("source", "unknown.pdf")
@@ -71,16 +112,25 @@ def answer_question(files, question):
 
     else:
         # Normal retrieval for non-summary queries
-        results = retrieve_answers(vectorstore, question, k=3)
+        results = vectorstore.similarity_search_with_score(
+            question,
+            k=5
+        )
 
-        if not results:
-            yield "<div class='gr-box'>No matching content found.</div>"
+        filtered_results = []
+        for doc, score in results:
+            if score is not None and score <= 0.7:
+                filtered_results.append(doc)
+
+        if not filtered_results:
+            yield "<div class='gr-box'>No matching content found for this question.</div>"
             return
+
 
         file_pages = {}
         context = ""
 
-        for res in results:
+        for res in filtered_results:
             page = res.metadata.get("page_number", "?")
             if isinstance(page, (list, tuple)):
                 page = page[0]
@@ -94,7 +144,6 @@ def answer_question(files, question):
             if page != "?":
                 file_pages[source].add(page)
 
-        # Build citation text for normal queries
         citation_text = "\n\nSources used:\n"
         for i, (file, pages) in enumerate(sorted(file_pages.items()), start=1):
             if pages:
@@ -106,7 +155,6 @@ def answer_question(files, question):
             else:
                 citation_text += f"{i}. {file}\n"
 
-    # System prompt remains simple
     system_prompt = """
     You are an assistant helping to answer questions about uploaded PDF documents.
     Answer concisely using the provided context.

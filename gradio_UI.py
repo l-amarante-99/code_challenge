@@ -37,9 +37,10 @@ def answer_question(question, progress=gr.Progress(track_tqdm=True)):
         yield "<div class='output-box'>⚠️ Please upload PDFs first.</div>"
         return
 
-    for i in range(50):
-        time.sleep(0.02)
-        progress((i + 1) / 50)
+    # Simulate quick progress animation
+    for i in range(5):
+        time.sleep(0.05)
+        progress((i + 1) / 5)
 
     results = retrieve_answers(vectorstore, question, k=10)
 
@@ -48,8 +49,8 @@ def answer_question(question, progress=gr.Progress(track_tqdm=True)):
         return
 
     file_pages = {}
-
     context = ""
+
     for res in results:
         page = res.metadata.get("page_number", "?")
         if isinstance(page, (list, tuple)):
@@ -100,16 +101,16 @@ Question:
 
     yield html_output
 
-# Define your custom CSS
+# Define custom CSS
 css = """
 body, .gradio-container {
     background-color: #e6f0fa;
 }
 
-.gr-button-primary {
-    background: linear-gradient(90deg, #70A1D7, #8A89C0);
-    color: white;
-    border: none;
+button {
+    background: linear-gradient(90deg, #70A1D7, #8A89C0) !important;
+    color: white !important;
+    border: none !important;
 }
 
 .output-box {
@@ -147,19 +148,26 @@ with gr.Blocks(theme=theme, css=css) as demo:
 
     output_ui = gr.HTML()
 
+    upload_ui.change(
+        fn=handle_upload,
+        inputs=[upload_ui],
+        outputs=output_ui
+    )
+
     with gr.Row():
         clear_btn = gr.Button("Clear")
         submit_btn = gr.Button("Submit", variant="primary")
 
-    def full_pipeline(files, question):
-        upload_msg = handle_upload(files)
-        for result in answer_question(question):
-            pass
-        return result
-
+    # Connect Submit button
     submit_btn.click(
-        fn=full_pipeline,
-        inputs=[upload_ui, question_ui],
+        fn=answer_question,
+        inputs=[question_ui],
+        outputs=output_ui
+    )
+
+    question_ui.submit(
+        fn=answer_question,
+        inputs=[question_ui],
         outputs=output_ui
     )
 

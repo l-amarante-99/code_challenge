@@ -18,11 +18,30 @@ vectorstore = None
 llm = OllamaLLM(model="tinyllama")
 
 def hash_file(path):
-    """Compute a hash of a PDF file for caching."""
+    """
+    Compute a SHA-256 hash of a PDF file's binary contents.
+
+    Args:
+        path (str): Path to the file.
+
+    Returns:
+        str: The hexadecimal SHA-256 hash of the file.
+    """
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
 
 def handle_upload(files):
+    """
+    Handles PDF file uploads from the UI, caching previously loaded files,
+    removing deleted PDFs from the vectorstore, and adding new documents
+    into the vectorstore for retrieval.
+
+    Args:
+        files (list[str]): List of file paths uploaded by the user.
+
+    Returns:
+        str: Status message indicating how many PDFs were loaded.
+    """
     global vectorstore, file_cache, active_files
 
     # Determine current filenames in the UI
@@ -79,6 +98,19 @@ def handle_upload(files):
     return f"✅ Loaded {len(files)} PDFs. Vector store now contains {len(split_docs)} new chunks."
 
 def answer_question(files, question):
+    """
+    Handles user queries against the uploaded PDFs by performing either:
+    - A summary of all documents if the user requests a summary
+    - A semantic search for relevant context, followed by generating an answer
+      from TinyLlama based on the retrieved context.
+
+    Args:
+        files (list[str]): List of file paths currently uploaded.
+        question (str): User's question.
+
+    Yields:
+        str: HTML-formatted partial responses streamed from TinyLlama.
+    """
     global vectorstore
 
     if vectorstore is None:
@@ -185,16 +217,20 @@ body, .gradio-container {
     background-color: #e6f0fa;
 }
 
+.gr-box {
+    border: 2px solid #70A1D7 !important;
+    border-radius: 8px;
+    color: #333333;
+}
+
+.gr-file-label {
+    color: white !important;
+}
+
 button {
     background: linear-gradient(90deg, #70A1D7, #8A89C0) !important;
     color: white !important;
     border: none !important;
-}
-
-.gr-box {
-    border: 2px solid #70A1D7 !important;
-    border-radius: 8px;
-    background-color: white;
 }
 
 #output {

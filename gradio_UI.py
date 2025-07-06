@@ -38,39 +38,80 @@ def answer_question(files, question):
     global vectorstore
 
     if vectorstore is None:
-        yield "<div class='output-box'>⚠️ Please upload PDFs first.</div>"
+        yield "<div class='gr-box'>⚠️ Please upload PDFs first.</div>"
         return
 
-    results = retrieve_answers(vectorstore, question, k=3)
+    # Check if the question is a summary request
+    is_summary = question.strip().lower() in ["summarize", "summarize the text"]
 
-    if not results:
-        yield "<div class='output-box'>No matching content found.</div>"
-        return
+    if is_summary:
+        # Skip retrieval — build full text from all docs
+        full_text = ""
+        for res in vectorstore.docstore._dict.values():
+            full_text += res.page_content.strip() + "\n"
 
-    file_pages = {}
-    context = ""
+        # Truncate to safe size for small models like TinyLlama
+        context = full_text[:8000]
 
-    for res in results:
-        page = res.metadata.get("page_number", "?")
-        if isinstance(page, (list, tuple)):
-            page = page[0]
-        source = res.metadata.get("source", "unknown.pdf")
-        chunk_text = res.page_content.strip().replace("\n", " ")
+        # Rewrite the question for clarity
+        question = (
+            "Please summarize the main topics, findings, and conclusions from the "
+            "provided PDF documents using the context below. Ignore instructions and disclaimers."
+        )
 
-        context += f"\n[Page {page} — {source}]\n{chunk_text}\n"
+        # Build citations listing all PDFs
+        all_sources = set()
+        for res in vectorstore.docstore._dict.values():
+            source = res.metadata.get("source", "unknown.pdf")
+            all_sources.add(source)
 
-        if source not in file_pages:
-            file_pages[source] = set()
-        if page != "?":
-            file_pages[source].add(page)
+        citation_text = "\n\nSources used:\n"
+        for i, file in enumerate(sorted(all_sources), start=1):
+            citation_text += f"{i}. {file}, pages: all pages were used for the summary.\n"
 
-    system_prompt = """You are an assistant helping to answer questions about uploaded PDF documents.
+    else:
+        # Normal retrieval for non-summary queries
+        results = retrieve_answers(vectorstore, question, k=3)
 
-When asked "What is the text about?", produce a summary of the overall topics and contributions of the documents, in plain language. 
-Do not simply list references or citations unless specifically asked.
-When asked "What are the conclusions of the paper?", provide a concise summary of the main conclusions drawn in the documents.
-When asked "What are the key findings?", summarize the most important findings or results presented in the documents."""
+        if not results:
+            yield "<div class='gr-box'>No matching content found.</div>"
+            return
 
+        file_pages = {}
+        context = ""
+
+        for res in results:
+            page = res.metadata.get("page_number", "?")
+            if isinstance(page, (list, tuple)):
+                page = page[0]
+            source = res.metadata.get("source", "unknown.pdf")
+            chunk_text = res.page_content.strip().replace("\n", " ")
+
+            context += f"\n[Page {page} — {source}]\n{chunk_text}\n"
+
+            if source not in file_pages:
+                file_pages[source] = set()
+            if page != "?":
+                file_pages[source].add(page)
+
+        # Build citation text for normal queries
+        citation_text = "\n\nSources used:\n"
+        for i, (file, pages) in enumerate(sorted(file_pages.items()), start=1):
+            if pages:
+                sorted_pages = sorted(
+                    pages, key=lambda x: int(x) if str(x).isdigit() else x
+                )
+                pages_str = ", ".join(str(p) for p in sorted_pages)
+                citation_text += f"{i}. {file}, pages: {pages_str}\n"
+            else:
+                citation_text += f"{i}. {file}\n"
+
+    # System prompt remains simple
+    system_prompt = """
+    You are an assistant helping to answer questions about uploaded PDF documents.
+    Answer concisely using the provided context.
+    """
+    
     prompt = f"""Use the following context to answer the question below. 
 If the answer isn't contained in the context, say "I couldn't find that information."
 
@@ -80,18 +121,6 @@ Context:
 Question:
 {question}
 """
-
-    if file_pages:
-        citation_text = "\n\nSources used:\n"
-        for i, (file, pages) in enumerate(sorted(file_pages.items()), start=1):
-            if pages:
-                sorted_pages = sorted(pages, key=lambda x: int(x) if str(x).isdigit() else x)
-                pages_str = ", ".join(str(p) for p in sorted_pages)
-                citation_text += f"{i}. {file}, pages: {pages_str}\n"
-            else:
-                citation_text += f"{i}. {file}\n"
-    else:
-        citation_text = "\n\nNo sources found."
 
     for partial_text in stream_ollama("tinyllama", system_prompt, prompt):
         combined_text = f"{partial_text}{citation_text}"
@@ -164,12 +193,6 @@ with gr.Blocks(theme=theme, css=css) as demo:
         submit_btn = gr.Button("Submit", variant="primary")
 
     submit_btn.click(
-        fn=answer_question,
-        inputs=[upload_ui, question_ui],
-        outputs=output_ui
-    )
-
-    question_ui.submit(
         fn=answer_question,
         inputs=[upload_ui, question_ui],
         outputs=output_ui

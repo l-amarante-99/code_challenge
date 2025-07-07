@@ -9,15 +9,13 @@ from langchain_ollama import OllamaLLM
 from ollama_stream import stream_ollama
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
-import re
+from keyword_extractor import extract_keywords_with_llm
 
-# Global caches
 file_cache = {}
 active_files = set()
 vectorstore = None
-vectorstore_cache = {}  # NEW: per-document vectorstore cache
+vectorstore_cache = {}
 
-# Instantiate TinyLlama
 llm = OllamaLLM(model="tinyllama")
 
 def hash_file(path):
@@ -49,10 +47,8 @@ def handle_upload(files):
 
     current_filenames = set(os.path.basename(path) for path in files)
 
-    # Identify removed PDFs
     removed_files = active_files - current_filenames
 
-    # Remove docs from vectorstore if any files were deleted
     if vectorstore is not None and removed_files:
         remaining_docs = []
         for doc in vectorstore.docstore._dict.values():
@@ -61,13 +57,11 @@ def handle_upload(files):
                 remaining_docs.append(doc)
         vectorstore = build_vector_store(remaining_docs) if remaining_docs else None
 
-    # Identify new files not loaded yet
     new_files = [
         path for path in files
         if os.path.basename(path) not in file_cache
     ]
 
-    # Load new files in parallel
     loaded_documents = []
     if new_files:
         with ThreadPoolExecutor() as executor:
@@ -79,22 +73,18 @@ def handle_upload(files):
                 if filename:
                     file_cache[filename] = docs
 
-    # Include any cached docs
     for filename in current_filenames:
         if filename in file_cache:
             loaded_documents.extend(file_cache[filename])
 
-    # Split loaded docs
     split_docs = split_documents(loaded_documents, chunk_size=1000, chunk_overlap=100)
 
-    # Update global vectorstore
     if split_docs:
         if vectorstore is None:
             vectorstore = build_vector_store(split_docs)
         else:
             vectorstore.add_documents(split_docs)
 
-    # Build per-document vectorstores
     vectorstore_cache.clear()
     for filename in current_filenames:
         chunks = [
@@ -115,8 +105,7 @@ def answer_question(files, question):
     - A hybrid keyword search + optional vector search to find relevant context
       from multiple PDFs, followed by generating an answer from TinyLlama.
 
-    This version requires at least TWO matching keywords per chunk
-    to reduce random matches from generic words.
+    This version requires at least TWO matching keywords per chunk.
 
     Args:
         files (list[str]): List of file paths currently uploaded.
@@ -131,11 +120,9 @@ def answer_question(files, question):
         yield "<div class='gr-box'>⚠️ Please upload PDFs first.</div>"
         return
 
-    # Check if the question is a summary request
     is_summary = question.strip().lower() in ["summarize", "summarize the text"]
 
     if is_summary:
-        # Skip retrieval — build full text from all docs
         full_text = ""
         for res in vectorstore.docstore._dict.values():
             full_text += res.page_content.strip() + "\n"
@@ -157,34 +144,19 @@ def answer_question(files, question):
             citation_text += f"{i}. {file}, pages: all pages were used for the summary.\n"
 
     else:
-        # Hybrid keyword + vector search per document
         filtered_results = []
 
-        # Extract keywords from the question
-        import re
-        def extract_keywords(question):
-            words = re.findall(r"\w+", question.lower())
-            stopwords = set([
-                "the", "and", "for", "with", "that", "this", "from", "using", 
-                "into", "over", "under", "between", "which", "what", "whose",
-                "these", "those", "also", "their", "there", "where", "when",
-                "how", "than", "such", "some", "have", "has", "been", "but",
-                "can", "could", "will", "would", "should", "may", "might"
-            ])
-            return [w for w in words if len(w) > 3 and w not in stopwords]
-
-        keywords = extract_keywords(question)
+        keywords = extract_keywords_with_llm(question)
 
         for filename, doc_vectorstore in vectorstore_cache.items():
             matching_chunks = []
             for chunk in doc_vectorstore.docstore._dict.values():
                 text = chunk.page_content.lower()
                 matches = [k for k in keywords if k in text]
-                if len(matches) >= 6:
+                if len(matches) >= 4:
                     matching_chunks.append(chunk)
 
             if matching_chunks:
-                # Build a local vectorstore from keyword-matching chunks
                 local_vectorstore = build_vector_store(matching_chunks)
                 doc_results = local_vectorstore.similarity_search_with_score(
                     question,

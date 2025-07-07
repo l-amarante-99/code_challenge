@@ -9,10 +9,13 @@ from langchain_ollama import OllamaLLM
 from ollama_stream import stream_ollama
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import re
 
-file_cache = {} 
+# Global caches
+file_cache = {}
 active_files = set()
 vectorstore = None
+vectorstore_cache = {}  # NEW: per-document vectorstore cache
 
 # Instantiate TinyLlama
 llm = OllamaLLM(model="tinyllama")
@@ -42,15 +45,14 @@ def handle_upload(files):
     Returns:
         str: Status message indicating how many PDFs were loaded.
     """
-    global vectorstore, file_cache, active_files
+    global vectorstore, file_cache, active_files, vectorstore_cache
 
-    # Determine current filenames in the UI
     current_filenames = set(os.path.basename(path) for path in files)
 
-    # Identify which PDFs were removed
+    # Identify removed PDFs
     removed_files = active_files - current_filenames
 
-    # Purge vectorstore docs from removed PDFs
+    # Remove docs from vectorstore if any files were deleted
     if vectorstore is not None and removed_files:
         remaining_docs = []
         for doc in vectorstore.docstore._dict.values():
@@ -77,7 +79,7 @@ def handle_upload(files):
                 if filename:
                     file_cache[filename] = docs
 
-    # Also include any cached docs
+    # Include any cached docs
     for filename in current_filenames:
         if filename in file_cache:
             loaded_documents.extend(file_cache[filename])
@@ -85,14 +87,23 @@ def handle_upload(files):
     # Split loaded docs
     split_docs = split_documents(loaded_documents, chunk_size=1000, chunk_overlap=100)
 
-    # Update vectorstore
+    # Update global vectorstore
     if split_docs:
         if vectorstore is None:
             vectorstore = build_vector_store(split_docs)
         else:
             vectorstore.add_documents(split_docs)
 
-    # Update active files
+    # Build per-document vectorstores
+    vectorstore_cache.clear()
+    for filename in current_filenames:
+        chunks = [
+            doc for doc in vectorstore.docstore._dict.values()
+            if doc.metadata.get("source") == filename
+        ]
+        if chunks:
+            vectorstore_cache[filename] = build_vector_store(chunks)
+
     active_files = current_filenames
 
     return f"✅ Loaded {len(files)} PDFs. Vector store now contains {len(split_docs)} new chunks."
@@ -101,8 +112,11 @@ def answer_question(files, question):
     """
     Handles user queries against the uploaded PDFs by performing either:
     - A summary of all documents if the user requests a summary
-    - A semantic search for relevant context, followed by generating an answer
-      from TinyLlama based on the retrieved context.
+    - A hybrid keyword search + optional vector search to find relevant context
+      from multiple PDFs, followed by generating an answer from TinyLlama.
+
+    This version requires at least TWO matching keywords per chunk
+    to reduce random matches from generic words.
 
     Args:
         files (list[str]): List of file paths currently uploaded.
@@ -111,7 +125,7 @@ def answer_question(files, question):
     Yields:
         str: HTML-formatted partial responses streamed from TinyLlama.
     """
-    global vectorstore
+    global vectorstore, vectorstore_cache
 
     if vectorstore is None:
         yield "<div class='gr-box'>⚠️ Please upload PDFs first.</div>"
@@ -143,21 +157,44 @@ def answer_question(files, question):
             citation_text += f"{i}. {file}, pages: all pages were used for the summary.\n"
 
     else:
-        # Normal retrieval for non-summary queries
-        results = vectorstore.similarity_search_with_score(
-            question,
-            k=5
-        )
-
+        # Hybrid keyword + vector search per document
         filtered_results = []
-        for doc, score in results:
-            if score is not None and score <= 0.7:
-                filtered_results.append(doc)
+
+        # Extract keywords from the question
+        import re
+        def extract_keywords(question):
+            words = re.findall(r"\w+", question.lower())
+            stopwords = set([
+                "the", "and", "for", "with", "that", "this", "from", "using", 
+                "into", "over", "under", "between", "which", "what", "whose",
+                "these", "those", "also", "their", "there", "where", "when",
+                "how", "than", "such", "some", "have", "has", "been", "but",
+                "can", "could", "will", "would", "should", "may", "might"
+            ])
+            return [w for w in words if len(w) > 3 and w not in stopwords]
+
+        keywords = extract_keywords(question)
+
+        for filename, doc_vectorstore in vectorstore_cache.items():
+            matching_chunks = []
+            for chunk in doc_vectorstore.docstore._dict.values():
+                text = chunk.page_content.lower()
+                matches = [k for k in keywords if k in text]
+                if len(matches) >= 6:
+                    matching_chunks.append(chunk)
+
+            if matching_chunks:
+                # Build a local vectorstore from keyword-matching chunks
+                local_vectorstore = build_vector_store(matching_chunks)
+                doc_results = local_vectorstore.similarity_search_with_score(
+                    question,
+                    k=3
+                )
+                filtered_results.extend([doc for doc, score in doc_results])
 
         if not filtered_results:
             yield "<div class='gr-box'>No matching content found for this question.</div>"
             return
-
 
         file_pages = {}
         context = ""
@@ -191,7 +228,7 @@ def answer_question(files, question):
     You are an assistant helping to answer questions about uploaded PDF documents.
     Answer concisely using the provided context.
     """
-    
+
     prompt = f"""Use the following context to answer the question below. 
 If the answer isn't contained in the context, say "I couldn't find that information."
 
